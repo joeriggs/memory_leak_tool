@@ -1,414 +1,500 @@
-#include <errno.h>
+
+#include <dlfcn.h>
+#include <execinfo.h>
 #include <fcntl.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#include <sys/queue.h>
+#include <sys/stat.h>
+
+#include <sys/types.h>
+
 #include "memory_leak_tool.h"
 
-// These are the functions that we're overriding.
-extern void * __libc_malloc(size_t size);
-extern void * __libc_calloc(size_t nmemb, size_t size);
-extern void * __libc_realloc(void *ptr, size_t size);
-extern void * __libc_memalign(size_t alignment, size_t size);
-extern void   __libc_free(void *ptr);
+#ifndef RTLD_NEXT
+#define RTLD_NEXT  ((void *) -1l)
+#endif
 
-// Set this flag to 1 to enable the alloc/free counters.
-static int tool_enabled = 0;
+#define MEM_HOOK_LOGGER printf
+#define LOG_FILE "/tmp/malloc.log"
 
-// Set this flag to 1 to enable periodic logging.  The number that you set will
-// be the number of seconds that we sleep before printing the alloc/free stats.
-static unsigned int periodic_logging_interval = 0;
+// Set this to 1 if you need to do some debugging.
+static int doDebugLogging = 0;
 
-// Set this flag to 1 if you want to reset the alloc/free stats after logging
-// them.  This is useful if you want to do something like display a new set of
-// stats every 60 seconds.
-static int reset_after_logging = 0;
+// This is set to 1 when the memory_leak_tool has been initialized.
+static int moduleInitialized = 0;
 
-// We create a thread that can be used to periodically log alloc/free data.
-// This is the PID of that thread.  It's not useful, but we keep it anyway.
-static pthread_t thread_id;
+// This is set to 1 when the user wants us to start tracking malloc/free events.
+static int memoryHooksEnabled = 0;
 
-// This mutex is used to protect the counters when multiple threads are running.
-static pthread_mutex_t data_mutex = PTHREAD_MUTEX_INITIALIZER;
+// We set this to 1 while we're adding an entry to our internal database,
+// removing an entry from the internal database, or dumping the internal
+// database to the log file.  It prevents us from being re-entered, which could
+// result in an infinite loop.
+static __thread int processingAnOperation = 0;
 
-// The total number of times that all of the various alloc functions were
-// called, and the total number of bytes requested by the calls.
-static int      allocate_counter = 0;
-static uint64_t allocate_bytes = 0;
+// These are pointers to the functions that we've overloaded.
+static void *(*__calloc)(size_t number, size_t size) = NULL;
+static void *(*__malloc)(size_t size) = NULL;
+static int   (*__posix_memalign)(void **ptr, size_t alignment, size_t size) = NULL;
+static void *(*__realloc)(void *ptr, size_t size) = NULL;
+static void  (*__free)(const void *addr) = NULL;
 
-// The total number of times that free() was called.
-static int      free_counter = 0;
+// We use 1 alloc_event object for each malloc operation that we're tracking.
+// This bunch of code defines the object, creates an array of objects that we
+// use to store the events that we're tracking, and a few counters.
+#define NUM_CALLERS 32
+typedef struct alloc_event {
+	size_t num_callers;
+	void *callers[NUM_CALLERS];
+	void *ptr;
+	size_t size;
+	TAILQ_ENTRY(alloc_event) tailq;
+} alloc_event;
+#define MY_QUEUE_SIZE 1000000
+static alloc_event alloc_event_array[MY_QUEUE_SIZE];
+static int alloc_event_adds = 0;
+static int alloc_event_dels = 0;
+static uint64_t total_bytes_allocated = 0;
+static uint64_t total_bytes_freed = 0;
 
-// The data for each caller is kept in a series of arrays.  This macro specifies
-// how many alloc and free callers we maintain.  If more than that shows up, then
-// we don't maintains counters for them.
-//
-// This is an artitrary number.  Feel free to increase or decrease it.
-#define MAX_CALLERS 100
+// This is the definition of the alloc_event_queue data type.  We create 2
+// queues of this type:
+// 1. free_event_queue - A list of unused entries.
+// 2. used_event_queue - An array of lists that contains the currently-tracked
+//    malloc events.
+TAILQ_HEAD(alloc_event_queue, alloc_event);
 
-// The *_ptrs array contains the PC address of a function that called an
-// alloc function.
-// The corresponding *_counts array contains the number of times that this
-// particular PC address called an alloc function.
-static void    *alloc_callers_ptrs[MAX_CALLERS];
-static uint64_t alloc_callers_counts[MAX_CALLERS];
+// This is a queue of unused entries.
+static struct alloc_event_queue free_event_queue;
+static pthread_mutex_t          free_event_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// The *_ptrs array contains the PC address of a function that called free().
-// The corresponding *_counts array contains the number of times that this
-// particular PC address called free().
-static void    *free_callers_ptrs[MAX_CALLERS];
-static uint64_t free_callers_counts[MAX_CALLERS];
+// This is a hash table that contains the list of current malloc events.
+#define NUM_USED_EVENT_QUEUE_BUCKETS 256
+#define BUCKET_MASK (NUM_USED_EVENT_QUEUE_BUCKETS - 1)
+static struct alloc_event_queue used_event_queue[NUM_USED_EVENT_QUEUE_BUCKETS];
+static pthread_mutex_t          used_event_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// You can ask for additional details.
-#define MAX_NUM_DETAIL_PTRS 1024
-static int     details_index = 0;
-static void   *details_ptrs[MAX_NUM_DETAIL_PTRS];
-static void   *details_pcs[MAX_NUM_DETAIL_PTRS];
-static size_t  details_sizes[MAX_NUM_DETAIL_PTRS];
-static char    details_events[MAX_NUM_DETAIL_PTRS];
+// On Linux, calling dlsym() to get the address of the "calloc" function
+// results in calloc() getting called again.  This is an array of buffers that
+// can be used to satisfy calloc() calls until dlsym() returns.  Once dlsym()
+// returns the address of the real calloc() function, then these buffers are
+// no longer used.  I think 1 buffer is sufficient, but we'll hang on to 100,
+// just in case.
+#define STATIC_CALLOC_BUF_SIZE 1024
+static unsigned char callocBuf[100][STATIC_CALLOC_BUF_SIZE];
+static void *callocBufBeg = &callocBuf[0][0];
+static void *callocBufEnd = &callocBuf[99][STATIC_CALLOC_BUF_SIZE - 1];
 
-/*******************************************************************************
- * This function is called each time one of the alloc functions is called.
- ******************************************************************************/
-static void record_alloc_event(void *caller, size_t size, void *ptr)
+/* ************************************************************************** */
+/* ************************************************************************** */
+/* **************** THESE ARE SOME PRIVATE UTILITY FUNCTIONS **************** */
+/* ************************************************************************** */
+/* ************************************************************************** */
+
+/* Add a malloc event to the hash table.
+ */
+static void alloc_event_add(void *ptr, size_t size)
 {
-	int i;
-
-	if (tool_enabled) {
-		pthread_mutex_lock(&data_mutex);
-
-		allocate_counter++;
-		allocate_bytes += size;
-
-		for(i = 0; i < MAX_CALLERS; i++) {
-			if(alloc_callers_ptrs[i] == caller) {
-				alloc_callers_counts[i]++;
-				break;
-			}
-			if(alloc_callers_ptrs[i] == NULL) {
-				alloc_callers_ptrs[i] = caller;
-				alloc_callers_counts[i]++;
-				break;
-			}
-		}
-
-		pthread_mutex_unlock(&data_mutex);
-	}
-}
-
-/*******************************************************************************
- * This function is called each time free() is called.
- ******************************************************************************/
-static void record_free_event(void *caller, void *ptr)
-{
-	if(ptr == NULL)
+	// If we're already processing an operation, just return.  We don't want
+	// to allow an infinite loop.
+	if (processingAnOperation)
 		return;
+	processingAnOperation = 1;
 
-	if (tool_enabled) {
-		pthread_mutex_lock(&data_mutex);
+	if (memoryHooksEnabled) {
+		/* Get an unused entry. */
+		pthread_mutex_lock(&free_event_queue_mutex);
+		if (TAILQ_EMPTY(&free_event_queue)) {
+			MEM_HOOK_LOGGER("Ran out of slots.\n");
+		}
+		struct alloc_event *first_entry = TAILQ_FIRST(&free_event_queue);
+		TAILQ_REMOVE(&free_event_queue, first_entry, tailq);
+		pthread_mutex_unlock(&free_event_queue_mutex);
 
-		free_counter++;
+		/* Get the backtrace to this call. */
+		void *tracePtrs[100];
+		int num_callers = backtrace(tracePtrs, 100);
+		if ((num_callers == 0) || (num_callers > 100)) {
+			MEM_HOOK_LOGGER("SPOTTED AN ERROR (%d) (%m).", num_callers);
+		}
+		/* The first 2 callers are our malloc_hook functions.  Skip them. */
+		first_entry->num_callers = num_callers - 2;
+		int x;
+		for (x = 0; (x < NUM_CALLERS) && (x < num_callers); x++) {
+			first_entry->callers[x] = tracePtrs[x + 2];
+		}
+		first_entry->ptr = ptr;
+		first_entry->size = size;
 
-		int i;
-		for(i = 0; i < MAX_CALLERS; i++) {
-			if(free_callers_ptrs[i] == caller) {
-				free_callers_counts[i]++;
-				break;
-			}
-			if(free_callers_ptrs[i] == NULL) {
-				free_callers_ptrs[i] = caller;
-				free_callers_counts[i]++;
+		uint64_t bucket = ((uint64_t) ptr >> 8) % BUCKET_MASK;
+
+		pthread_mutex_lock(&used_event_queue_mutex);
+		TAILQ_INSERT_TAIL(&used_event_queue[bucket], first_entry, tailq);
+		alloc_event_adds++;
+		total_bytes_allocated += size;
+		pthread_mutex_unlock(&used_event_queue_mutex);
+	}
+
+	processingAnOperation = 0;
+}
+
+/* Remove a malloc event from the hash table.
+ */
+static void alloc_event_del(void *ptr)
+{
+	// If we're already processing an operation, just return.  We don't want
+	// to allow an infinite loop.
+	if (processingAnOperation)
+		return;
+	processingAnOperation = 1;
+
+	if (memoryHooksEnabled) {
+		uint64_t bucket = ((uint64_t) ptr >> 8) % BUCKET_MASK;
+
+		pthread_mutex_lock(&used_event_queue_mutex);
+		struct alloc_event *entry;
+		TAILQ_FOREACH(entry, &used_event_queue[bucket], tailq) {
+			if (entry->ptr == ptr) {
+				total_bytes_freed += entry->size;
+				alloc_event_dels++;
+				TAILQ_REMOVE(&used_event_queue[bucket], entry, tailq);
 				break;
 			}
 		}
+		pthread_mutex_unlock(&used_event_queue_mutex);
 
-		pthread_mutex_unlock(&data_mutex);
+		if (entry) {
+			pthread_mutex_lock(&free_event_queue_mutex);
+			TAILQ_INSERT_TAIL(&free_event_queue, entry, tailq);
+			pthread_mutex_unlock(&free_event_queue_mutex);
+		}
 	}
+
+	processingAnOperation = 0;
 }
 
-/*******************************************************************************
- * These are the libc alloc/free functions that we override.
- ******************************************************************************/
+/* This is a thread that you can start.  It allows you to externally control the
+ * memory_leak_tool by using "touch" to create files in the /tmp directory.
+ */
+static void *malloc_hooks_thread(void *arg)
+{
+	char *gp_path = (char *)arg;
+
+	while(1) {
+		sleep(1);
+
+		struct stat s;
+		if (stat("/tmp/doq", &s) == 0) {
+			MEM_HOOK_LOGGER("Start the queue.");
+			unlink("/tmp/doq");
+			memoryHooksEnabled = 1;
+		}
+		if (stat("/tmp/noq", &s) == 0) {
+			MEM_HOOK_LOGGER("Stop the queue.");
+			unlink("/tmp/noq");
+			memoryHooksEnabled = 0;
+		}
+		if (stat("/tmp/print", &s) == 0) {
+			MEM_HOOK_LOGGER("Print the queue.");
+			unlink("/tmp/print");
+			memory_leak_tool_log_data();
+		}
+		if (stat("/tmp/reset", &s) == 0) {
+			MEM_HOOK_LOGGER("Reset the queue.");
+			unlink("/tmp/reset");
+			memory_leak_tool_reset();
+		}
+	}
+
+	return NULL;
+}
+
+/* ************************************************************************** */
+/* ************************************************************************** */
+/* ************ THESE ARE THE OVERLOADED ALLOC AND FREE FUNCTIONS *********** */
+/* ************************************************************************** */
+/* ************************************************************************** */
+
+void *calloc(size_t number, size_t size)
+{
+	if (__calloc == NULL) {
+		static int called_dlsym = 0;
+
+		/* We need to make sure we only call dlsym() once.  dlsym() is
+		 * going to eventually call us again, so we need to make sure we
+		 * don't get caught in a loop. */
+		if (!called_dlsym) {
+			called_dlsym = 1;
+			__calloc = dlsym(RTLD_NEXT, "calloc");
+		}
+
+		else {
+			/* While dlsym() is fetching the address of the "calloc"
+			 * function for us, we will handle any interim calls to
+			 * calloc() by returning the addresses of some static
+			 * arrays. */
+			if (size > STATIC_CALLOC_BUF_SIZE) {
+				static char *crashPtr = NULL;
+				*crashPtr = 0;
+			}
+
+			static int index = 0;
+			unsigned char *b = &callocBuf[index++][0];
+
+			memset(b, 0, STATIC_CALLOC_BUF_SIZE);
+			return b;
+		}
+	}
+
+	void *ptr = __calloc(number, size);
+
+	alloc_event_add(ptr, size);
+
+	return ptr;
+}
 
 void *malloc(size_t size)
 {
-	void *retAddr = __builtin_return_address(0);
-	void *ptr = __libc_malloc(size);
-	record_alloc_event(retAddr, size, ptr);
+	if (__malloc == NULL)
+		__malloc = dlsym(RTLD_NEXT, "malloc");
+
+	void *ptr = __malloc(size);
+
+	alloc_event_add(ptr, size);
+
 	return ptr;
 }
 
-void *calloc(size_t nmemb, size_t size)
+int posix_memalign(void **ptr, size_t alignment, size_t size)
 {
-	void *retAddr = __builtin_return_address(0);
-	void *ptr = __libc_calloc(nmemb, size);
-	record_alloc_event(retAddr, size, ptr);
-	return ptr;
+	if (__posix_memalign == NULL)
+		__posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
+
+	int rc = __posix_memalign(ptr, alignment, size);
+
+	alloc_event_add(*ptr, size);
+
+	return rc;
 }
 
 void *realloc(void *ptr, size_t size)
 {
-	void *retAddr = __builtin_return_address(0);
-	void *new_ptr = __libc_realloc(ptr, size);
-	record_alloc_event(retAddr, size, new_ptr);
+	if (__realloc == NULL)
+		__realloc = dlsym(RTLD_NEXT, "realloc");
+
+	void *new_ptr = __realloc(ptr, size);
+
+	alloc_event_add(new_ptr, size);
+
 	return new_ptr;
-}
-
-int posix_memalign(void **memptr, size_t alignment, size_t size)
-{
-	void *retAddr = __builtin_return_address(0);
-	*memptr = __libc_memalign(alignment, size);
-	record_alloc_event(retAddr, size, memptr);
-	if(*memptr != NULL) {
-		return 0;
-	}
-	else {
-		return ENOMEM;
-	}
-}
-
-void *aligned_alloc(size_t alignment, size_t size)
-{
-	void *retAddr = __builtin_return_address(0);
-	void *ptr = __libc_memalign(alignment, size);
-	record_alloc_event(retAddr, size, ptr);
-	return ptr;
 }
 
 void free(void *ptr)
 {
-	void *retAddr = __builtin_return_address(0);
-	record_free_event(retAddr, ptr);
-	return __libc_free(ptr);
+	/* If the caller is freeing one of our static buffers, then return. */
+	if ((ptr >= callocBufBeg) && (ptr <= callocBufEnd))
+		return;
+
+	if (__free == NULL)
+		__free = dlsym(RTLD_NEXT, "free");
+
+	__free(ptr);
+
+	alloc_event_del(ptr);
 }
 
-/*******************************************************************************
- * Reset all of the alloc/free counters.  This is useful if you want to run a
- * single test and evaluate the counters for that test.
- ******************************************************************************/
-static void reset_counters(int alreadyLocked)
+/* ************************************************************************** */
+/* ************************************************************************** */
+/* **************************** PUBLIC FUNCTIONS **************************** */
+/* ************************************************************************** */
+/* ************************************************************************** */
+
+/* Initialize the memory_leak_tool.  You need to call this function before you
+ * try to do anything else with the memory_leak_tool.
+ *
+ * Note that this doesn't start any tracking activities.  You need to call
+ * memory_leak_tool_start() in order to start tracking malloc/free activity.
+ *
+ * Returns:
+ *   0 = success.
+ *   1 = failure.
+ */
+int memory_leak_tool_init(void)
 {
+	int retcode = 0;
+
+	TAILQ_INIT(&free_event_queue);
+
 	int i;
-
-	if(!alreadyLocked)
-		pthread_mutex_lock(&data_mutex);
-
-	allocate_counter = 0;
-	allocate_bytes = 0;
-	free_counter = 0;
-
-	for(i = 0; i < MAX_CALLERS; i++) {
-		alloc_callers_ptrs[i]     = 0;
-		alloc_callers_counts[i]   = 0;
-		free_callers_ptrs[i]      = 0;
-		free_callers_counts[i]    = 0;
+	for (i = 0; i < NUM_USED_EVENT_QUEUE_BUCKETS; i++) {
+		TAILQ_INIT(&used_event_queue[i]);
 	}
 
-	details_index = 0;
-	for(i = 0; i < MAX_NUM_DETAIL_PTRS; i++) {
-		details_ptrs[i]   = NULL;
-		details_pcs[i]    = NULL;
-		details_sizes[i]  = 0;
-		details_events[i] = ' ';
+	pthread_mutex_lock(&free_event_queue_mutex);
+	for (i = 0; i < MY_QUEUE_SIZE; i++) {
+		TAILQ_INSERT_TAIL(&free_event_queue, &alloc_event_array[i], tailq);
+	}
+	pthread_mutex_unlock(&free_event_queue_mutex);
+
+	pthread_t tid;
+	retcode = pthread_create(&tid, NULL, malloc_hooks_thread, NULL);
+	if (retcode) {
+		MEM_HOOK_LOGGER("pthread_create() failed (%m).");
 	}
 
-	if(!alreadyLocked)
-		pthread_mutex_unlock(&data_mutex);
+	moduleInitialized = 1;
+
+	return retcode;
 }
 
-/*******************************************************************************
- * This is a thread that can be used to periodically log memory_leak_tool data.
- ******************************************************************************/
-static int thread_func(void *arg)
+/* Start tracking malloc/free events.
+ *
+ * Returns:
+ *   0 = success.
+ *   1 = failure.
+ */
+int memory_leak_tool_start(void)
 {
-	(void) arg;
-	unsigned int sleepInterval = 0;
+	if (!moduleInitialized) {
+		MEM_HOOK_LOGGER("memory_leak_tool has not been initialized.  Please call memory_leak_tool_init().");
+		return 1;
+	}
 
-	while(tool_enabled) {
-		sleep(1);
+	memoryHooksEnabled = 1;
+	return 0;
+}
 
-		if((periodic_logging_interval > 0) && (++sleepInterval >= periodic_logging_interval)) {
-			memory_leak_tool_log_data();
-			sleepInterval = 0;
+/* Stop tracking malloc/free events.
+ *
+ * Returns:
+ *   0 = success.
+ *   1 = failure.
+ */
+int memory_leak_tool_stop(void)
+{
+	if (!moduleInitialized) {
+		MEM_HOOK_LOGGER("memory_leak_tool has not been initialized.  Please call memory_leak_tool_init().");
+		return 1;
+	}
+
+	memoryHooksEnabled = 0;
+	return 0;
+}
+
+/* Reset the memory_leak_tool.  This purges all of the tracking data that has
+ * been stored internally.  If the memory_leak_tool has been started, then it
+ * continues to run.
+ *
+ * Returns:
+ *   0 = success.
+ *   1 = failure.
+ */
+int memory_leak_tool_reset(void)
+{
+	if (!moduleInitialized) {
+		MEM_HOOK_LOGGER("memory_leak_tool has not been initialized.  Please call memory_leak_tool_init().");
+		return 1;
+	}
+
+	pthread_mutex_lock(&used_event_queue_mutex);
+	pthread_mutex_lock(&free_event_queue_mutex);
+
+	int i;
+	for (i = 0; i < NUM_USED_EVENT_QUEUE_BUCKETS; i++) {
+		struct alloc_event *entry;
+		TAILQ_FOREACH(entry, &used_event_queue[i], tailq) {
+			TAILQ_REMOVE(&used_event_queue[i], entry, tailq);
+			TAILQ_INSERT_TAIL(&free_event_queue, entry, tailq);
 		}
 	}
 
-	return 0;
-}
+	alloc_event_adds = 0;
+	alloc_event_dels = 0;
+	total_bytes_allocated = 0;
+	total_bytes_freed = 0;
 
-/*******************************************************************************
- *******************************************************************************
- ******************************* Public functions ******************************
- *******************************************************************************
- ******************************************************************************/
-
-
-/*******************************************************************************
- * Call this function to start the memory_leak_tool.
- *
- * Output:
- *   0 = success.
- *   1 = failure.
- ******************************************************************************/
-int memory_leak_tool_start(void)
-{
-	reset_counters(0);
-
-	tool_enabled = 1;
-
-	pthread_attr_t tattr;
-	if(pthread_attr_init(&tattr)) {
-		fprintf(stderr, "ERROR: thread attr init fail (%m).");
-		return 1;
-	}
-	if(pthread_create(&thread_id, &tattr, (void *) thread_func, NULL)) {
-		fprintf(stderr, "ERROR: thread start fail (%m).");
-		return 1;
-	}
-	if(pthread_attr_destroy(&tattr)) {
-		fprintf(stderr, "ERROR: thread attr destroy fail (%m).");
-		return 1;
-	}
+	pthread_mutex_unlock(&free_event_queue_mutex);
+	pthread_mutex_unlock(&used_event_queue_mutex);
 
 	return 0;
 }
 
-/*******************************************************************************
- * Call this function to stop the memory_leak_tool.
+/* Dump the tracking data that is currently stored inside the memory_leak_tool.
+ * The data is dumped to a log file.
  *
- * Output:
+ * Returns:
  *   0 = success.
  *   1 = failure.
- ******************************************************************************/
-void memory_leak_tool_stop(void)
-{
-	tool_enabled = 0;
-}
-
-/*******************************************************************************
- * Reset the internal counters. 
- ******************************************************************************/
-void memory_leak_tool_reset_counters(void)
-{
-	reset_counters(0);
-}
-
-/*******************************************************************************
- * Log the current set of alloc/free data.
- ******************************************************************************/
+ */
 int memory_leak_tool_log_data(void)
 {
-	void    *tmp_alloc_callers_ptrs[MAX_CALLERS];
-	uint64_t tmp_alloc_callers_counts[MAX_CALLERS];
-
-	void    *tmp_free_callers_ptrs[MAX_CALLERS];
-	uint64_t tmp_free_callers_counts[MAX_CALLERS];
-
-	int      tmp_details_Index;
-	void    *tmp_details_ptrs[MAX_NUM_DETAIL_PTRS];
-	void    *tmp_details_pcs[MAX_NUM_DETAIL_PTRS];
-	size_t   tmp_details_sizes[MAX_NUM_DETAIL_PTRS];
-	char     tmp_details_events[MAX_NUM_DETAIL_PTRS];
-
-	int a_counter, f_counter;
-	uint64_t a_bytes;
-	int allocIndex, freeIndex;
-
-	memset(tmp_alloc_callers_ptrs,       0, sizeof(tmp_alloc_callers_ptrs));
-	memset(tmp_alloc_callers_counts,     0, sizeof(tmp_alloc_callers_counts));
-	memset(tmp_free_callers_ptrs,        0, sizeof(tmp_free_callers_ptrs));
-	memset(tmp_free_callers_counts,      0, sizeof(tmp_free_callers_counts));
-	memset(tmp_details_ptrs,             0, sizeof(tmp_details_ptrs));
-	memset(tmp_details_pcs,              0, sizeof(tmp_details_pcs));
-	memset(tmp_details_sizes,            0, sizeof(tmp_details_sizes));
-	memset(tmp_details_events,         ' ', sizeof(tmp_details_events));
-
-	pthread_mutex_lock(&data_mutex);
-
-	a_counter = allocate_counter;
-	a_bytes = allocate_bytes;
-	f_counter = free_counter;
-
-	for(allocIndex = 0; (allocIndex < MAX_CALLERS) && (alloc_callers_ptrs[allocIndex] != NULL); allocIndex++) {
-		tmp_alloc_callers_ptrs[allocIndex] = alloc_callers_ptrs[allocIndex];
-		tmp_alloc_callers_counts[allocIndex] = alloc_callers_counts[allocIndex];
+	if (!moduleInitialized) {
+		MEM_HOOK_LOGGER("memory_leak_tool has not been initialized.  Please call memory_leak_tool_init().");
+		return 1;
 	}
 
-	for(freeIndex = 0; (freeIndex < MAX_CALLERS) && (free_callers_ptrs[freeIndex] != NULL); freeIndex++) {
-		tmp_free_callers_ptrs[freeIndex] = free_callers_ptrs[freeIndex];
-		tmp_free_callers_counts[freeIndex] = free_callers_counts[freeIndex];
+	int num_entries = 0;
+
+	processingAnOperation = 1;
+
+	const char *separator = "=========================================================";
+
+	int fd = open(LOG_FILE, O_RDWR | O_CREAT | O_TRUNC, 0777);
+	if (fd == -1) {
+		MEM_HOOK_LOGGER("Unable to open log file (%s).\n", LOG_FILE);
+		return 1;
 	}
+	dprintf(fd, "%s\n", separator);
 
-	tmp_details_Index = details_index;
+	pthread_mutex_lock(&used_event_queue_mutex);
+	pthread_mutex_lock(&free_event_queue_mutex);
 
+	dprintf(fd, "alloc_event_adds %d (%ld) : alloc_event_dels %d (%ld) : diff %d (%ld).\n",
+		alloc_event_adds, total_bytes_allocated, alloc_event_dels, total_bytes_freed,
+		alloc_event_adds - alloc_event_dels, total_bytes_allocated - total_bytes_freed);
+
+	size_t num_alloced = 0;
 	int i;
-	for(i = 0; i < tmp_details_Index; i++) {
-		tmp_details_ptrs[i]   = details_ptrs[i];
-		tmp_details_pcs[i]    = details_pcs[i];
-		tmp_details_sizes[i]  = details_sizes[i];
-		tmp_details_events[i] = details_events[i];
+	for (i = 0; i < NUM_USED_EVENT_QUEUE_BUCKETS; i++) {
+		struct alloc_event *entry;
+		TAILQ_FOREACH(entry, &used_event_queue[i], tailq) {
+
+			num_entries++;
+			num_alloced += entry->size;
+
+			char callerList[NUM_CALLERS * 32];
+			memset(callerList, 0, sizeof(callerList));
+			int x;
+			for (x = 0; (x < NUM_CALLERS) && (x < entry->num_callers); x++) {
+				char oneCaller[32];
+				sprintf(oneCaller, "%p ", entry->callers[x]);
+				strcat(callerList, oneCaller);
+			}
+			dprintf(fd, "Ptr %p: Size %ld: Callers (%ld) (%s).\n",
+				    entry->ptr, entry->size, entry->num_callers, callerList);
+		}
 	}
 
-	// Optionally reset the counters.
-	if(reset_after_logging) {
-		reset_counters(1);
-	}
-
-	pthread_mutex_unlock(&data_mutex);
-
-	int fd = open("/tmp/memory_leak_tool.log", O_RDWR | O_APPEND | O_CREAT, S_IRWXU | S_IRWXG | S_IRWXO);
-
-	char buf[1024];
-
-	snprintf(buf, sizeof(buf), "alloc callers [%d] : free callers [%d] : allocs [%d] : bytes [%lu] : frees [%d].\n",
-	         allocIndex, freeIndex, a_counter, a_bytes, f_counter);
-	write(fd, buf, strlen(buf));
-
-	snprintf(buf, sizeof(buf), "alloc counters ---------------------------------------------------------\n");
-	write(fd, buf, strlen(buf));
-
-	for(i = 0; i < allocIndex; i++) {
-		snprintf(buf, sizeof(buf), "[%d] : Caller [%p] : Count [%lu].\n", i,
-		         tmp_alloc_callers_ptrs[i], tmp_alloc_callers_counts[i]);
-		write(fd, buf, strlen(buf));
-	}
-
-	snprintf(buf, sizeof(buf), "free counters ---------------------------------------------------------\n");
-	write(fd, buf, strlen(buf));
-
-	for(i = 0; i < freeIndex; i++) {
-		snprintf(buf, sizeof(buf), "[%d] : Caller [%p] : Count [%lu].\n", i,
-		         tmp_free_callers_ptrs[i], tmp_free_callers_counts[i]);
-		write(fd, buf, strlen(buf));
-	}
-
-	snprintf(buf, sizeof(buf), "Details ----------------------------------------------------------------\n");
-	write(fd, buf, strlen(buf));
-
-	for(i = 0; i < tmp_details_Index; i++) {
-		snprintf(buf, sizeof(buf), "[%c] [%p] [%p] [%lu]\n", tmp_details_events[i], tmp_details_pcs[i],
-		         tmp_details_ptrs[i], tmp_details_sizes[i]);
-		write(fd, buf, strlen(buf));
-	}
-
-	snprintf(buf, sizeof(buf), "mallinfo() -------------------------------------------------------------\n");
-	write(fd, buf, strlen(buf));
+	pthread_mutex_unlock(&free_event_queue_mutex);
+	pthread_mutex_unlock(&used_event_queue_mutex);
+	dprintf(fd, "num_entries %d.  num_alloced %ld.\n", num_entries, num_alloced);
+	dprintf(fd, "%s\n", separator);
 
 	struct mallinfo mInfo = mallinfo();
-	snprintf(buf, sizeof(buf),
-	       "arena = %u, ordblks = %u, smblks = %u, hblks = %u, hblkhd = %u, usmblks = %u, fsmblks = %u, uordblks = %u, fordblks = %u, keepcost = %u\n",
+	dprintf(fd, "mallinfo(): arena = %u, ordblks = %u, smblks = %u, hblks = %u, hblkhd = %u, usmblks = %u, fsmblks = %u, uordblks = %u, fordblks = %u, keepcost = %u\n",
 	        mInfo.arena, mInfo.ordblks, mInfo.smblks, mInfo.hblks, mInfo.hblkhd,
 	        mInfo.usmblks, mInfo.fsmblks, mInfo.uordblks, mInfo.fordblks, mInfo.keepcost);
-	write(fd, buf, strlen(buf));
+	dprintf(fd, "%s\n", separator);
 
-	snprintf(buf, sizeof(buf), "========================================================================\n");
-	write(fd, buf, strlen(buf));
+	close(fd);
 
-	int closeResult = close(fd);
-
-	return 0;
+	processingAnOperation = 0;
 }
 
