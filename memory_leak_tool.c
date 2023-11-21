@@ -24,9 +24,6 @@
 #define MEM_HOOK_LOGGER printf
 #define LOG_FILE "/tmp/malloc.log"
 
-// Set this to 1 if you need to do some debugging.
-static int doDebugLogging = 0;
-
 // This is set to 1 when the memory_leak_tool has been initialized.
 static int moduleInitialized = 0;
 
@@ -46,7 +43,7 @@ static int   (*__posix_memalign)(void **ptr, size_t alignment, size_t size) = NU
 static void *(*__realloc)(void *ptr, size_t size) = NULL;
 static void  (*__free)(const void *addr) = NULL;
 
-// We use 1 alloc_event object for each malloc operation that we're tracking.
+// We use one alloc_event object for each malloc operation that we're tracking.
 // This bunch of code defines the object, creates an array of objects that we
 // use to store the events that we're tracking, and a few counters.
 #define NUM_CALLERS 32
