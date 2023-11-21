@@ -11,5 +11,5 @@ test.o : test.c memory_leak_tool.h
 	gcc -O0 -g -c test.c
 
 clean :
-	rm -f test test.o memory_leak_tool.o
+	rm -f test test.o memory_leak_tool.o libmemory_leak_tool.a
 
