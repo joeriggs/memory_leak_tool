@@ -532,6 +532,7 @@ int memory_leak_tool_log_data(void)
 	dprintf(fd, "alloc_event_adds %d (%ld) : alloc_event_dels %d (%ld) : diff %d (%ld).\n",
 		alloc_event_adds, total_bytes_allocated, alloc_event_dels, total_bytes_freed,
 		alloc_event_adds - alloc_event_dels, total_bytes_allocated - total_bytes_freed);
+	dprintf(fd, "%s\n", separator);
 
 	int i;
 
