@@ -32,7 +32,7 @@ static const char *separator = "================================================
 // This is set to 1 when the memory_leak_tool has been initialized.
 static int moduleInitialized = 0;
 
-// This is set to 1 when the user wants us to start tracking malloc/free events.
+// This is set to 1 when the user wants us to track malloc/free events.
 static int memoryHooksEnabled = 0;
 
 // We set this to 1 while we're adding an entry to our internal database,
@@ -71,9 +71,11 @@ static uint64_t total_bytes_freed = 0;
 // This is the definition of the alloc_event_queue data type.  We create 3
 // queues of this type:
 // 1. free_event_queue    - A list of unused entries.
+//
 // 2. used_event_queue    - A hash table that contains the currently-tracked
 //                          malloc events.  The allocated memory address is used
 //                          as the key.
+//
 // 3. callers_event_queue - A hash table that contains the currently-tracked
 //                          malloc events.  The caller's PC is used as the key.
 TAILQ_HEAD(alloc_event_queue, alloc_event);
@@ -82,15 +84,17 @@ TAILQ_HEAD(alloc_event_queue, alloc_event);
 static struct alloc_event_queue free_event_queue;
 static pthread_mutex_t          free_event_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// This is 2 hash tables that contain the list of current malloc events.
-// 1. used_event_queue uses the allocated memory address as the key.
-// 2. callers_event_queue uses the PC of the caller as the key.
-// address of the allocated memory is used as the key.
+// This is a hash table that contains the list of current malloc events.  The
+// search key is the allocated address.
 #define EVENT_QUEUE_NUM_BUCKETS 256
 #define EVENT_QUEUE_BUCKET_MASK (EVENT_QUEUE_NUM_BUCKETS - 1)
 static struct alloc_event_queue used_event_queue[EVENT_QUEUE_NUM_BUCKETS];
-static struct alloc_event_queue callers_event_queue[EVENT_QUEUE_NUM_BUCKETS];
 static pthread_mutex_t          used_event_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// This is a hash table that contains the list of current malloc events.  The
+// search key is the PC that called the allocate function.
+static struct alloc_event_queue callers_event_queue[EVENT_QUEUE_NUM_BUCKETS];
+static pthread_mutex_t          callers_event_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // On Linux, calling dlsym() to get the address of the "calloc" function
 // results in calloc() getting called again.  This is an array of buffers that
@@ -147,17 +151,18 @@ static void alloc_event_add(void *ptr, size_t size)
 		uint64_t used_event_queue_bucket    = ((uint64_t) ptr                   >> 8) % EVENT_QUEUE_BUCKET_MASK;
 		uint64_t callers_event_queue_bucket = ((uint64_t) new_entry->callers[0] >> 0) % EVENT_QUEUE_BUCKET_MASK;
 
-		pthread_mutex_lock(&used_event_queue_mutex);
-
 		// Place the entry in the used_event_queue.
+		pthread_mutex_lock(&used_event_queue_mutex);
 		TAILQ_INSERT_TAIL(&used_event_queue[used_event_queue_bucket], new_entry, tailq);
 		alloc_event_adds++;
 		total_bytes_allocated += size;
+		pthread_mutex_unlock(&used_event_queue_mutex);
 
 		// Look through the callers_event_queue to see if this caller backtrace
 		// is already in the list.
 		// 1. If it's in the list, then increment the reference_count.
 		// 2. If it's not in the list, then add it.
+		pthread_mutex_lock(&callers_event_queue_mutex);
 		struct alloc_event *new_caller_entry;
 		int found_duplicate_entry = 0;
 		TAILQ_FOREACH(new_caller_entry, &callers_event_queue[callers_event_queue_bucket], tailq) {
@@ -195,8 +200,7 @@ static void alloc_event_add(void *ptr, size_t size)
 			new_entry->caller_event = new_caller_entry;
 			TAILQ_INSERT_TAIL(&callers_event_queue[callers_event_queue_bucket], new_caller_entry, tailq);
 		}
-
-		pthread_mutex_unlock(&used_event_queue_mutex);
+		pthread_mutex_unlock(&callers_event_queue_mutex);
 	}
 
 	processingAnOperation = 0;
@@ -239,6 +243,8 @@ static void alloc_event_del(void *ptr)
 			// reference_count, and remove it if the reference_count is zero.
 			struct alloc_event *callers_event_queue_entry = used_event_queue_entry->caller_event;
 			if (callers_event_queue_entry) {
+				pthread_mutex_lock(&callers_event_queue_mutex);
+
 				callers_event_queue_entry->reference_count--;
 
 				if (!callers_event_queue_entry->reference_count) {
@@ -250,6 +256,7 @@ static void alloc_event_del(void *ptr)
 					TAILQ_INSERT_TAIL(&free_event_queue, callers_event_queue_entry, tailq);
 					pthread_mutex_unlock(&free_event_queue_mutex);
 				}
+				pthread_mutex_unlock(&callers_event_queue_mutex);
 			}
 		}
 	}
@@ -264,19 +271,21 @@ static void *malloc_hooks_thread(void *arg)
 {
 	char *gp_path = (char *)arg;
 
+	MEM_HOOK_LOGGER("Starting the thread.");
+
 	while(1) {
 		sleep(1);
 
 		struct stat s;
-		if (stat("/tmp/doq", &s) == 0) {
+		if (stat("/tmp/start", &s) == 0) {
 			MEM_HOOK_LOGGER("Start the queue.");
-			unlink("/tmp/doq");
-			memoryHooksEnabled = 1;
+			memory_leak_tool_start();
+			unlink("/tmp/start");
 		}
-		if (stat("/tmp/noq", &s) == 0) {
+		if (stat("/tmp/stop", &s) == 0) {
 			MEM_HOOK_LOGGER("Stop the queue.");
-			unlink("/tmp/noq");
-			memoryHooksEnabled = 0;
+			memory_leak_tool_stop();
+			unlink("/tmp/stop");
 		}
 		if (stat("/tmp/print", &s) == 0) {
 			MEM_HOOK_LOGGER("Print the queue.");
@@ -498,6 +507,7 @@ int memory_leak_tool_reset(void)
 		return 1;
 	}
 
+	pthread_mutex_lock(&callers_event_queue_mutex);
 	pthread_mutex_lock(&used_event_queue_mutex);
 	pthread_mutex_lock(&free_event_queue_mutex);
 
@@ -514,13 +524,14 @@ int memory_leak_tool_reset(void)
 		}
 	}
 
+	pthread_mutex_unlock(&free_event_queue_mutex);
+	pthread_mutex_unlock(&used_event_queue_mutex);
+	pthread_mutex_unlock(&callers_event_queue_mutex);
+
 	alloc_event_adds = 0;
 	alloc_event_dels = 0;
 	total_bytes_allocated = 0;
 	total_bytes_freed = 0;
-
-	pthread_mutex_unlock(&free_event_queue_mutex);
-	pthread_mutex_unlock(&used_event_queue_mutex);
 
 	return 0;
 }
@@ -548,9 +559,6 @@ int memory_leak_tool_log_data(void)
 	}
 	dprintf(fd, "%s\n", separator);
 
-	pthread_mutex_lock(&used_event_queue_mutex);
-	pthread_mutex_lock(&free_event_queue_mutex);
-
 	dprintf(fd, "alloc_event_adds %d (%ld) : alloc_event_dels %d (%ld) : diff %d (%ld).\n",
 		alloc_event_adds, total_bytes_allocated, alloc_event_dels, total_bytes_freed,
 		alloc_event_adds - alloc_event_dels, total_bytes_allocated - total_bytes_freed);
@@ -559,6 +567,7 @@ int memory_leak_tool_log_data(void)
 	int i;
 
 	// Print the list that is sorted by "caller's PC".
+	pthread_mutex_lock(&callers_event_queue_mutex);
 	for (i = 0; i < EVENT_QUEUE_NUM_BUCKETS; i++) {
 		struct alloc_event *entry;
 		TAILQ_FOREACH(entry, &callers_event_queue[i], tailq) {
@@ -576,11 +585,13 @@ int memory_leak_tool_log_data(void)
 				entry->num_callers, callerList);
 		}
 	}
+	pthread_mutex_unlock(&callers_event_queue_mutex);
 	dprintf(fd, "%s\n", separator);
 
 	// Print the list that is sorted by "allocated address".
 	int num_entries = 0;
 	size_t total_bytes_allocated = 0;
+	pthread_mutex_lock(&used_event_queue_mutex);
 	for (i = 0; i < EVENT_QUEUE_NUM_BUCKETS; i++) {
 		struct alloc_event *entry;
 		TAILQ_FOREACH(entry, &used_event_queue[i], tailq) {
@@ -600,12 +611,11 @@ int memory_leak_tool_log_data(void)
 				    entry->ptr, entry->size, entry->num_callers, callerList);
 		}
 	}
+	pthread_mutex_unlock(&used_event_queue_mutex);
 	dprintf(fd, "num_entries %d.  total_bytes_allocated %ld.\n", num_entries, total_bytes_allocated);
 	dprintf(fd, "%s\n", separator);
 
-	pthread_mutex_unlock(&free_event_queue_mutex);
-	pthread_mutex_unlock(&used_event_queue_mutex);
-
+	// Get statistics related to the process heap.
 	struct mallinfo mInfo = mallinfo();
 	dprintf(fd, "mallinfo(): arena = %u, ordblks = %u, smblks = %u, hblks = %u, hblkhd = %u, usmblks = %u, fsmblks = %u, uordblks = %u, fordblks = %u, keepcost = %u\n",
 	        mInfo.arena, mInfo.ordblks, mInfo.smblks, mInfo.hblks, mInfo.hblkhd,
