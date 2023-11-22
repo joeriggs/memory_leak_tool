@@ -4,10 +4,12 @@
 #include <fcntl.h>
 #include <malloc.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #include <sys/queue.h>
@@ -21,7 +23,9 @@
 #define RTLD_NEXT  ((void *) -1l)
 #endif
 
-#define MEM_HOOK_LOGGER printf
+static void memory_leak_tool_log_msg(const char *fmt, ...);
+#define MEM_HOOK_LOGGER memory_leak_tool_log_msg
+
 #define LOG_FILE "/tmp/malloc.log"
 static const char *separator = "=========================================================";
 
@@ -289,6 +293,20 @@ static void *malloc_hooks_thread(void *arg)
 	return NULL;
 }
 
+/* Log a message to syslog.  This is useful for debugging as well as letting
+ * the user know what's going on inside the memory_leak_tool.
+ *
+ * Just bear in mind that logging activities may also involve memory allocate
+ * and free operations.
+ */
+static void memory_leak_tool_log_msg(const char *fmt, ...)
+{
+	va_list args;
+	va_start(args, fmt);
+	vsyslog(LOG_ERR, fmt, args);
+	va_end(args);
+}
+
 /* ************************************************************************** */
 /* ************************************************************************** */
 /* ************ THESE ARE THE OVERLOADED ALLOC AND FREE FUNCTIONS *********** */
@@ -403,6 +421,9 @@ int memory_leak_tool_init(void)
 {
 	int retcode = 0;
 
+	openlog("memory_leak_tool", LOG_NDELAY | LOG_PID, LOG_DAEMON);
+	MEM_HOOK_LOGGER("Initializing the memory_leak_tool.\n");
+
 	int i;
 	for (i = 0; i < EVENT_QUEUE_NUM_BUCKETS; i++) {
 		TAILQ_INIT(&used_event_queue[i]);
@@ -422,6 +443,7 @@ int memory_leak_tool_init(void)
 		MEM_HOOK_LOGGER("pthread_create() failed (%m).");
 	}
 
+	MEM_HOOK_LOGGER("memory_leak_tool is initialized.\n");
 	moduleInitialized = 1;
 
 	return retcode;
