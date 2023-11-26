@@ -53,13 +53,23 @@ static void  (*__free)(const void *addr) = NULL;
 // use to store the events that we're tracking, and a few counters.
 #define NUM_CALLERS 32
 typedef struct alloc_event {
+	// This is the backtrace of the caller.
 	size_t num_callers;
 	void *callers[NUM_CALLERS];
+
+	// Pointer to the entry in the callers_event_queue for this exact
+	// backtrace.  Also, for the entry that is in the callers_event_queue,
+	// the reference count.
+	struct alloc_event *caller_event;
+	int add_reference_count;
+	int del_reference_count;
+
+	// The address of the allocated memory, and its size.
 	void *ptr;
 	size_t size;
-	int reference_count;
+
+	// How we hook it into the list that its stored on.
 	TAILQ_ENTRY(alloc_event) tailq;
-	struct alloc_event *caller_event;
 } alloc_event;
 #define MY_QUEUE_SIZE 1000000
 static alloc_event alloc_event_array[MY_QUEUE_SIZE];
@@ -106,6 +116,8 @@ static pthread_mutex_t          callers_event_queue_mutex = PTHREAD_MUTEX_INITIA
 static unsigned char callocBuf[100][STATIC_CALLOC_BUF_SIZE];
 static void *callocBufBeg = &callocBuf[0][0];
 static void *callocBufEnd = &callocBuf[99][STATIC_CALLOC_BUF_SIZE - 1];
+
+static struct mallinfo start_minfo;
 
 /* ************************************************************************** */
 /* ************************************************************************** */
@@ -160,7 +172,7 @@ static void alloc_event_add(void *ptr, size_t size)
 
 		// Look through the callers_event_queue to see if this caller backtrace
 		// is already in the list.
-		// 1. If it's in the list, then increment the reference_count.
+		// 1. If it's in the list, then increment the add_reference_count.
 		// 2. If it's not in the list, then add it.
 		pthread_mutex_lock(&callers_event_queue_mutex);
 		struct alloc_event *new_caller_entry;
@@ -177,7 +189,7 @@ static void alloc_event_add(void *ptr, size_t size)
 				}
 
 				if (i == new_caller_entry->num_callers) {
-					new_caller_entry->reference_count++;
+					new_caller_entry->add_reference_count++;
 					new_entry->caller_event = new_caller_entry;
 					found_duplicate_entry = 1;
 				}
@@ -196,7 +208,8 @@ static void alloc_event_add(void *ptr, size_t size)
 			pthread_mutex_unlock(&free_event_queue_mutex);
 
 			memcpy(new_caller_entry, new_entry, sizeof(*new_entry));
-			new_caller_entry->reference_count = 1;
+			new_caller_entry->add_reference_count = 1;
+			new_caller_entry->del_reference_count = 0;
 			new_entry->caller_event = new_caller_entry;
 			TAILQ_INSERT_TAIL(&callers_event_queue[callers_event_queue_bucket], new_caller_entry, tailq);
 		}
@@ -239,15 +252,16 @@ static void alloc_event_del(void *ptr)
 
 			uint64_t callers_event_queue_bucket = ((uint64_t) used_event_queue_entry->callers[0] >> 0) % EVENT_QUEUE_BUCKET_MASK;
 
-			// Get the callers_event_queue entry for the backtrace, decrement the
-			// reference_count, and remove it if the reference_count is zero.
+			// Get the callers_event_queue entry for the backtrace, increment the
+			// del_reference_count, and (optionally) remove it if the reference_counts
+			// indicate the entry is no longer needed.
 			struct alloc_event *callers_event_queue_entry = used_event_queue_entry->caller_event;
 			if (callers_event_queue_entry) {
 				pthread_mutex_lock(&callers_event_queue_mutex);
 
-				callers_event_queue_entry->reference_count--;
+				callers_event_queue_entry->del_reference_count++;
 
-				if (!callers_event_queue_entry->reference_count) {
+				if (callers_event_queue_entry->del_reference_count == callers_event_queue_entry->add_reference_count) {
 					pthread_mutex_lock(&used_event_queue_mutex);
 					TAILQ_REMOVE(&callers_event_queue[callers_event_queue_bucket], callers_event_queue_entry, tailq);
 					pthread_mutex_unlock(&used_event_queue_mutex);
@@ -430,6 +444,10 @@ int memory_leak_tool_init(void)
 {
 	int retcode = 0;
 
+	// Get the starting malloc info.
+	start_minfo = mallinfo();
+
+	// We log stuff to syslog.
 	openlog("memory_leak_tool", LOG_NDELAY | LOG_PID, LOG_DAEMON);
 	MEM_HOOK_LOGGER("Initializing the memory_leak_tool.\n");
 
@@ -470,6 +488,9 @@ int memory_leak_tool_start(void)
 		MEM_HOOK_LOGGER("memory_leak_tool has not been initialized.  Please call memory_leak_tool_init().");
 		return 1;
 	}
+
+	// Get the starting malloc info.
+	start_minfo = mallinfo();
 
 	memoryHooksEnabled = 1;
 	return 0;
@@ -514,13 +535,31 @@ int memory_leak_tool_reset(void)
 	int i;
 	for (i = 0; i < EVENT_QUEUE_NUM_BUCKETS; i++) {
 		struct alloc_event *entry;
-		TAILQ_FOREACH(entry, &used_event_queue[i], tailq) {
+
+		// Walk the used_event_queue, and move all entries back to the free_event_queue.
+		entry = used_event_queue[i].tqh_first;
+		while (entry) {
+
 			TAILQ_REMOVE(&used_event_queue[i], entry, tailq);
+
+			struct alloc_event *next_entry = entry->tailq.tqe_next;
+
 			TAILQ_INSERT_TAIL(&free_event_queue, entry, tailq);
+
+			entry = next_entry;
 		}
-		TAILQ_FOREACH(entry, &callers_event_queue[i], tailq) {
+
+		// Walk the callers_event_queue, and move all entries back to the free_event_queue.
+		entry = callers_event_queue[i].tqh_first;
+		while (entry) {
+
 			TAILQ_REMOVE(&callers_event_queue[i], entry, tailq);
+
+			struct alloc_event *next_entry = entry->tailq.tqe_next;
+
 			TAILQ_INSERT_TAIL(&free_event_queue, entry, tailq);
+
+			entry = next_entry;
 		}
 	}
 
@@ -552,6 +591,8 @@ int memory_leak_tool_log_data(void)
 
 	processingAnOperation = 1;
 
+	malloc_trim(0);
+
 	int fd = open(LOG_FILE, O_RDWR | O_CREAT | O_TRUNC, 0777);
 	if (fd == -1) {
 		MEM_HOOK_LOGGER("Unable to open log file (%s).\n", LOG_FILE);
@@ -580,9 +621,9 @@ int memory_leak_tool_log_data(void)
 				sprintf(oneCaller, "%p ", entry->callers[x]);
 				strcat(callerList, oneCaller);
 			}
-			dprintf(fd, "Reference count %4d: Size %7ld: Callers (%ld) ( %s).\n",
-				entry->reference_count, entry->size,
-				entry->num_callers, callerList);
+			dprintf(fd, "Add ref count %4d: Del ref count %4d: Size %7ld: Callers (%ld) ( %s).\n",
+				entry->add_reference_count, entry->del_reference_count, 
+				entry->size, entry->num_callers, callerList);
 		}
 	}
 	pthread_mutex_unlock(&callers_event_queue_mutex);
@@ -615,11 +656,35 @@ int memory_leak_tool_log_data(void)
 	dprintf(fd, "num_entries %d.  total_bytes_allocated %ld.\n", num_entries, total_bytes_allocated);
 	dprintf(fd, "%s\n", separator);
 
-	// Get statistics related to the process heap.
-	struct mallinfo mInfo = mallinfo();
-	dprintf(fd, "mallinfo(): arena = %u, ordblks = %u, smblks = %u, hblks = %u, hblkhd = %u, usmblks = %u, fsmblks = %u, uordblks = %u, fordblks = %u, keepcost = %u\n",
-	        mInfo.arena, mInfo.ordblks, mInfo.smblks, mInfo.hblks, mInfo.hblkhd,
-	        mInfo.usmblks, mInfo.fsmblks, mInfo.uordblks, mInfo.fordblks, mInfo.keepcost);
+	// Get current statistics related to the process heap.
+	struct mallinfo m = mallinfo();
+
+	dprintf(fd, "mallinfo() comparison:\n");
+	dprintf(fd, "                                                                     Current      Original\n");
+	dprintf(fd, "        Name      Description                                         Value         Value       Difference\n");
+	dprintf(fd, "    --------      -------------------------------------------      ----------    ----------     ----------\n");
+	dprintf(fd, "       arena      Non-mmapped space allocated (bytes)              %10d    %10d     %10d\n",
+		m.arena,      start_minfo.arena,    (m.arena    - start_minfo.arena));
+	dprintf(fd, "     ordblks      Number of free chunks                            %10d    %10d     %10d\n",
+		m.ordblks,    start_minfo.ordblks,  (m.ordblks  - start_minfo.ordblks));
+	dprintf(fd, "      smblks      Number of free fastbin blocks                    %10d    %10d     %10d\n",
+		m.smblks,     start_minfo.smblks,   (m.smblks   - start_minfo.smblks));
+	dprintf(fd, "       hblks      Number of mmapped regions                        %10d    %10d     %10d\n",
+		m.hblks,      start_minfo.hblks,    (m.hblks    - start_minfo.hblks));
+	dprintf(fd, "      hblkhd      Space allocated in mmapped regions (bytes)       %10d    %10d     %10d\n",
+		m.hblkhd,     start_minfo.hblkhd,   (m.hblkhd   - start_minfo.hblkhd));
+	dprintf(fd, "     usmblks      Maximum total allocated space (bytes)            %10d    %10d     %10d\n",
+		m.usmblks,    start_minfo.usmblks,  (m.usmblks  - start_minfo.usmblks));
+	dprintf(fd, "     fsmblks      Space in freed fastbin blocks (bytes)            %10d    %10d     %10d\n",
+		m.fsmblks,    start_minfo.fsmblks,  (m.fsmblks  - start_minfo.fsmblks));
+	dprintf(fd, "    uordblks      Total allocated space (bytes)                    %10d    %10d     %10d\n",
+		m.uordblks,   start_minfo.uordblks, (m.uordblks - start_minfo.uordblks));
+	dprintf(fd, "    fordblks      Total free space (bytes)                         %10d    %10d     %10d\n",
+		m.fordblks,   start_minfo.fordblks, (m.fordblks - start_minfo.fordblks));
+	dprintf(fd, "    keepcost      Top-most, releasable space (bytes)               %10d    %10d     %10d\n",
+		m.keepcost,   start_minfo.keepcost, (m.keepcost - start_minfo.keepcost));
+	dprintf(fd, "\n");
+
 	dprintf(fd, "%s\n", separator);
 
 	close(fd);
