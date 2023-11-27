@@ -5,6 +5,9 @@ ToDo List:
 
 - realloc() needs to remove the old ptr from the lists.
 
+- List requirements:
+  - libxml2-dev
+
 - Can we initialize to the point where we don't personally cause any additional
   allocate operations to occur?  We don't want our own code to contaminate the
   trace data.

@@ -593,17 +593,17 @@ int memory_leak_tool_log_data(void)
 
 	malloc_trim(0);
 
-	int fd = open(LOG_FILE, O_RDWR | O_CREAT | O_TRUNC, 0777);
-	if (fd == -1) {
+	FILE *fp = fopen(LOG_FILE, "w+");
+	if (fp == NULL) {
 		MEM_HOOK_LOGGER("Unable to open log file (%s).\n", LOG_FILE);
 		return 1;
 	}
-	dprintf(fd, "%s\n", separator);
+	fprintf(fp, "%s\n", separator);
 
-	dprintf(fd, "alloc_event_adds %d (%ld) : alloc_event_dels %d (%ld) : diff %d (%ld).\n",
+	fprintf(fp, "alloc_event_adds %d (%ld) : alloc_event_dels %d (%ld) : diff %d (%ld).\n",
 		alloc_event_adds, total_bytes_allocated, alloc_event_dels, total_bytes_freed,
 		alloc_event_adds - alloc_event_dels, total_bytes_allocated - total_bytes_freed);
-	dprintf(fd, "%s\n", separator);
+	fprintf(fp, "%s\n", separator);
 
 	int i;
 
@@ -621,13 +621,13 @@ int memory_leak_tool_log_data(void)
 				sprintf(oneCaller, "%p ", entry->callers[x]);
 				strcat(callerList, oneCaller);
 			}
-			dprintf(fd, "Add ref count %4d: Del ref count %4d: Size %7ld: Callers (%ld) ( %s).\n",
+			fprintf(fp, "Add ref count %4d: Del ref count %4d: Size %7ld: Callers (%ld) ( %s).\n",
 				entry->add_reference_count, entry->del_reference_count, 
 				entry->size, entry->num_callers, callerList);
 		}
 	}
 	pthread_mutex_unlock(&callers_event_queue_mutex);
-	dprintf(fd, "%s\n", separator);
+	fprintf(fp, "%s\n", separator);
 
 	// Print the list that is sorted by "allocated address".
 	int num_entries = 0;
@@ -648,46 +648,50 @@ int memory_leak_tool_log_data(void)
 				sprintf(oneCaller, "%p ", entry->callers[x]);
 				strcat(callerList, oneCaller);
 			}
-			dprintf(fd, "Ptr %p: Size %7ld: Callers (%ld) ( %s).\n",
+			fprintf(fp, "Ptr %p: Size %7ld: Callers (%ld) ( %s).\n",
 				    entry->ptr, entry->size, entry->num_callers, callerList);
 		}
 	}
 	pthread_mutex_unlock(&used_event_queue_mutex);
-	dprintf(fd, "num_entries %d.  total_bytes_allocated %ld.\n", num_entries, total_bytes_allocated);
-	dprintf(fd, "%s\n", separator);
+	fprintf(fp, "num_entries %d.  total_bytes_allocated %ld.\n", num_entries, total_bytes_allocated);
+	fprintf(fp, "%s\n", separator);
 
 	// Get current statistics related to the process heap.
 	struct mallinfo m = mallinfo();
 
-	dprintf(fd, "mallinfo() comparison:\n");
-	dprintf(fd, "                                                                     Current      Original\n");
-	dprintf(fd, "        Name      Description                                         Value         Value       Difference\n");
-	dprintf(fd, "    --------      -------------------------------------------      ----------    ----------     ----------\n");
-	dprintf(fd, "       arena      Non-mmapped space allocated (bytes)              %10d    %10d     %10d\n",
+	fprintf(fp, "mallinfo() comparison:\n");
+	fprintf(fp, "                                                                     Current      Original\n");
+	fprintf(fp, "        Name      Description                                         Value         Value       Difference\n");
+	fprintf(fp, "    --------      -------------------------------------------      ----------    ----------     ----------\n");
+	fprintf(fp, "       arena      Non-mmapped space allocated (bytes)              %10d    %10d     %10d\n",
 		m.arena,      start_minfo.arena,    (m.arena    - start_minfo.arena));
-	dprintf(fd, "     ordblks      Number of free chunks                            %10d    %10d     %10d\n",
+	fprintf(fp, "     ordblks      Number of free chunks                            %10d    %10d     %10d\n",
 		m.ordblks,    start_minfo.ordblks,  (m.ordblks  - start_minfo.ordblks));
-	dprintf(fd, "      smblks      Number of free fastbin blocks                    %10d    %10d     %10d\n",
+	fprintf(fp, "      smblks      Number of free fastbin blocks                    %10d    %10d     %10d\n",
 		m.smblks,     start_minfo.smblks,   (m.smblks   - start_minfo.smblks));
-	dprintf(fd, "       hblks      Number of mmapped regions                        %10d    %10d     %10d\n",
+	fprintf(fp, "       hblks      Number of mmapped regions                        %10d    %10d     %10d\n",
 		m.hblks,      start_minfo.hblks,    (m.hblks    - start_minfo.hblks));
-	dprintf(fd, "      hblkhd      Space allocated in mmapped regions (bytes)       %10d    %10d     %10d\n",
+	fprintf(fp, "      hblkhd      Space allocated in mmapped regions (bytes)       %10d    %10d     %10d\n",
 		m.hblkhd,     start_minfo.hblkhd,   (m.hblkhd   - start_minfo.hblkhd));
-	dprintf(fd, "     usmblks      Maximum total allocated space (bytes)            %10d    %10d     %10d\n",
+	fprintf(fp, "     usmblks      Maximum total allocated space (bytes)            %10d    %10d     %10d\n",
 		m.usmblks,    start_minfo.usmblks,  (m.usmblks  - start_minfo.usmblks));
-	dprintf(fd, "     fsmblks      Space in freed fastbin blocks (bytes)            %10d    %10d     %10d\n",
+	fprintf(fp, "     fsmblks      Space in freed fastbin blocks (bytes)            %10d    %10d     %10d\n",
 		m.fsmblks,    start_minfo.fsmblks,  (m.fsmblks  - start_minfo.fsmblks));
-	dprintf(fd, "    uordblks      Total allocated space (bytes)                    %10d    %10d     %10d\n",
+	fprintf(fp, "    uordblks      Total allocated space (bytes)                    %10d    %10d     %10d\n",
 		m.uordblks,   start_minfo.uordblks, (m.uordblks - start_minfo.uordblks));
-	dprintf(fd, "    fordblks      Total free space (bytes)                         %10d    %10d     %10d\n",
+	fprintf(fp, "    fordblks      Total free space (bytes)                         %10d    %10d     %10d\n",
 		m.fordblks,   start_minfo.fordblks, (m.fordblks - start_minfo.fordblks));
-	dprintf(fd, "    keepcost      Top-most, releasable space (bytes)               %10d    %10d     %10d\n",
+	fprintf(fp, "    keepcost      Top-most, releasable space (bytes)               %10d    %10d     %10d\n",
 		m.keepcost,   start_minfo.keepcost, (m.keepcost - start_minfo.keepcost));
-	dprintf(fd, "\n");
+	fprintf(fp, "\n");
+	fprintf(fp, "%s\n", separator);
 
-	dprintf(fd, "%s\n", separator);
+	// Dump the malloc_info() output into the log file.  This output will show
+	// all of the arenas.
+	malloc_info(0, fp);
+	fprintf(fp, "%s\n", separator);
 
-	close(fd);
+	fclose(fp);
 
 	processingAnOperation = 0;
 }
