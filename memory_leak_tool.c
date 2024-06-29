@@ -12,11 +12,12 @@
 #include <syslog.h>
 #include <unistd.h>
 
+#include <sys/mman.h>
 #include <sys/queue.h>
 #include <sys/stat.h>
-
 #include <sys/types.h>
 
+#include "breakpoint.h"
 #include "memory_leak_tool.h"
 
 #ifndef RTLD_NEXT
@@ -120,9 +121,7 @@ static void *callocBufEnd = &callocBuf[99][STATIC_CALLOC_BUF_SIZE - 1];
 static struct mallinfo start_minfo;
 
 /* ************************************************************************** */
-/* ************************************************************************** */
 /* **************** THESE ARE SOME PRIVATE UTILITY FUNCTIONS **************** */
-/* ************************************************************************** */
 /* ************************************************************************** */
 
 /* Add a malloc event to the hash table.
@@ -157,6 +156,7 @@ static void alloc_event_add(void *ptr, size_t size)
 		for (x = 0; (x < NUM_CALLERS) && (x < num_callers); x++) {
 			new_entry->callers[x] = tracePtrs[x + 2];
 		}
+
 		new_entry->ptr = ptr;
 		new_entry->size = size;
 
@@ -332,8 +332,99 @@ static void memory_leak_tool_log_msg(const char *fmt, ...)
 
 /* ************************************************************************** */
 /* ************************************************************************** */
-/* ************ THESE ARE THE OVERLOADED ALLOC AND FREE FUNCTIONS *********** */
+/* *************** Callback functions for mmap() and munmap(). ************** */
 /* ************************************************************************** */
+/* ************************************************************************** */
+
+/* Pre-processing callback function for mmap().  Whenever mmap() is called,
+ * this function will be called before mmap() executes.
+ *
+ * Input:
+ *   addr, len, proc, flags, fd, off - The args that were passed to mmap() by
+ *                                     the caller.
+ *   arg_07 - arg_10 are unused.
+ *
+ * Output:
+ *   The return code isn't used at this time.
+ */
+static __thread size_t mmap_len;
+
+static int mmap_pre_cb(uint64_t arg_01, uint64_t arg_02, uint64_t arg_03, uint64_t arg_04, uint64_t arg_05,
+                       uint64_t arg_06, uint64_t arg_07, uint64_t arg_08, uint64_t arg_09, uint64_t arg_10)
+{
+	void *addr = (void *) arg_01;
+	size_t len = (size_t) arg_02;
+	int prot   = (int)    arg_03;
+	int flags  = (int)    arg_04;
+	int fildes = (int)    arg_05;
+	off_t off  = (off_t)  arg_06;
+	printf("%s(): mmap(%p, %ld, %d, 0x%x, %d, %ld)\n", __FUNCTION__, addr, len, prot, flags, fildes, off);
+
+	mmap_len = len;
+
+	return 0;
+}
+
+/* Post-processing callback function for mmap().  Whenever mmap() is called,
+ * this function will be called after mmap() executes.
+ *
+ * Input:
+ *   retcode - The mmap-ed address that will be returned from mmap(), and
+ *             passed back to the caller.
+ *
+ * Output:
+ *   The return code isn't used at this time.
+ */
+static int mmap_post_cb(uint64_t retcode)
+{
+	void *ptr = (void *) retcode;
+	printf("%s(): ptr [%p] : mmap_len [%ld].\n", __FUNCTION__, ptr, mmap_len);
+
+//	alloc_event_add(ptr, mmap_len);
+	return 0;
+}
+
+/* Pre-processing callback function for munmap().  Whenever munmap() is called,
+ * this function will be called before munmap() executes.
+ *
+ * Input:
+ *   addr, len - The args that were passed to munmap() by the caller.
+ *   arg_03 - arg_10 are unused.
+ *
+ * Output:
+ *   The return code isn't used at this time.
+ */
+static int munmap_pre_cb(uint64_t arg_01, uint64_t arg_02, uint64_t arg_03, uint64_t arg_04, uint64_t arg_05,
+                         uint64_t arg_06, uint64_t arg_07, uint64_t arg_08, uint64_t arg_09, uint64_t arg_10)
+{
+	void *addr = (void *) arg_01;
+	size_t len = (size_t) arg_02;
+	printf("%s(): munmap(%p, %ld)\n", __FUNCTION__, addr, len);
+
+	alloc_event_del(addr);
+
+	return 0;
+}
+
+/* Post-processing callback function for munmap().  Whenever munmap() is called,
+ * this function will be called after munmap() executes.
+ *
+ * Input:
+ *   retcode - The return code that munmap() returned.
+ *
+ * Output:
+ *   The return code isn't used at this time.
+ */
+static int munmap_post_cb(uint64_t retcode)
+{
+	int rc = retcode;
+	printf("%s(): rc [%d].\n", __FUNCTION__, rc);
+
+	return 0;
+}
+
+/* ************************************************************************** */
+/* ************ THESE ARE THE OVERLOADED ALLOC AND FREE FUNCTIONS *********** */
 /* ************************************************************************** */
 
 void *calloc(size_t number, size_t size)
@@ -463,6 +554,10 @@ int memory_leak_tool_init(void)
 		TAILQ_INSERT_TAIL(&free_event_queue, &alloc_event_array[i], tailq);
 	}
 	pthread_mutex_unlock(&free_event_queue_mutex);
+
+	retcode = breakpoint_handler_init();
+	retcode = breakpoint_handler_set(mmap, mmap_pre_cb, mmap_post_cb);
+	retcode = breakpoint_handler_set(munmap, munmap_pre_cb, munmap_post_cb);
 
 	pthread_t tid;
 	retcode = pthread_create(&tid, NULL, malloc_hooks_thread, NULL);
