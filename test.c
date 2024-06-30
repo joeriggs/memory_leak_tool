@@ -48,7 +48,6 @@ static int mmap_test_alloc(void)
 #include <ucontext.h>
 		ucontext_t ucp;
 		getcontext(&ucp);
-		printf("JOE RIGGS IS HERE %llx\n", ucp.uc_mcontext.gregs[REG_RIP]);
 		mmap_test_ptr = mmap(0, 65536, PROT_READ | PROT_WRITE, MAP_SHARED, mmap_test_fd, 0);
 		if (!mmap_test_ptr) {
 			printf("%s(): mmap() failed (%m).\n", __FUNCTION__);

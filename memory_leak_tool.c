@@ -24,6 +24,12 @@
 #define RTLD_NEXT  ((void *) -1l)
 #endif
 
+// MMAP support isn't working yet, so leave it disabled.
+#undef MMAP_SUPPORT
+
+// Ubuntu prefers mallinfo2().
+#define USE_MALLINFO2
+
 static void memory_leak_tool_log_msg(const char *fmt, ...);
 #define MEM_HOOK_LOGGER memory_leak_tool_log_msg
 
@@ -118,7 +124,11 @@ static unsigned char callocBuf[100][STATIC_CALLOC_BUF_SIZE];
 static void *callocBufBeg = &callocBuf[0][0];
 static void *callocBufEnd = &callocBuf[99][STATIC_CALLOC_BUF_SIZE - 1];
 
+#ifdef USE_MALLINFO2
+static struct mallinfo2 start_minfo;
+#else
 static struct mallinfo start_minfo;
+#endif
 
 /* ************************************************************************** */
 /* **************** THESE ARE SOME PRIVATE UTILITY FUNCTIONS **************** */
@@ -330,6 +340,8 @@ static void memory_leak_tool_log_msg(const char *fmt, ...)
 	va_end(args);
 }
 
+#ifdef MMAP_SUPPORT
+
 /* ************************************************************************** */
 /* ************************************************************************** */
 /* *************** Callback functions for mmap() and munmap(). ************** */
@@ -422,6 +434,7 @@ static int munmap_post_cb(uint64_t retcode)
 
 	return 0;
 }
+#endif // MMAP_SUPPORT
 
 /* ************************************************************************** */
 /* ************ THESE ARE THE OVERLOADED ALLOC AND FREE FUNCTIONS *********** */
@@ -536,7 +549,11 @@ int memory_leak_tool_init(void)
 	int retcode = 0;
 
 	// Get the starting malloc info.
+#ifdef USE_MALLINFO2
+	start_minfo = mallinfo2();
+#else
 	start_minfo = mallinfo();
+#endif
 
 	// We log stuff to syslog.
 	openlog("memory_leak_tool", LOG_NDELAY | LOG_PID, LOG_DAEMON);
@@ -555,9 +572,11 @@ int memory_leak_tool_init(void)
 	}
 	pthread_mutex_unlock(&free_event_queue_mutex);
 
+#ifdef MMAP_SUPPORT
 	retcode = breakpoint_handler_init();
 	retcode = breakpoint_handler_set(mmap, mmap_pre_cb, mmap_post_cb);
 	retcode = breakpoint_handler_set(munmap, munmap_pre_cb, munmap_post_cb);
+#endif
 
 	pthread_t tid;
 	retcode = pthread_create(&tid, NULL, malloc_hooks_thread, NULL);
@@ -585,7 +604,11 @@ int memory_leak_tool_start(void)
 	}
 
 	// Get the starting malloc info.
+#ifdef USE_MALLINFO2
+	start_minfo = mallinfo2();
+#else
 	start_minfo = mallinfo();
+#endif
 
 	memoryHooksEnabled = 1;
 	return 0;
@@ -752,31 +775,35 @@ int memory_leak_tool_log_data(void)
 	fprintf(fp, "%s\n", separator);
 
 	// Get current statistics related to the process heap.
+#ifdef USE_MALLINFO2
+	struct mallinfo2 m = mallinfo2();
+#else
 	struct mallinfo m = mallinfo();
+#endif
 
 	fprintf(fp, "mallinfo() comparison:\n");
 	fprintf(fp, "                                                                     Current      Original\n");
 	fprintf(fp, "        Name      Description                                         Value         Value       Difference\n");
 	fprintf(fp, "    --------      -------------------------------------------      ----------    ----------     ----------\n");
-	fprintf(fp, "       arena      Non-mmapped space allocated (bytes)              %10d    %10d     %10d\n",
+	fprintf(fp, "       arena      Non-mmapped space allocated (bytes)              %10ld    %10ld     %10ld\n",
 		m.arena,      start_minfo.arena,    (m.arena    - start_minfo.arena));
-	fprintf(fp, "     ordblks      Number of free chunks                            %10d    %10d     %10d\n",
+	fprintf(fp, "     ordblks      Number of free chunks                            %10ld    %10ld     %10ld\n",
 		m.ordblks,    start_minfo.ordblks,  (m.ordblks  - start_minfo.ordblks));
-	fprintf(fp, "      smblks      Number of free fastbin blocks                    %10d    %10d     %10d\n",
+	fprintf(fp, "      smblks      Number of free fastbin blocks                    %10ld    %10ld     %10ld\n",
 		m.smblks,     start_minfo.smblks,   (m.smblks   - start_minfo.smblks));
-	fprintf(fp, "       hblks      Number of mmapped regions                        %10d    %10d     %10d\n",
+	fprintf(fp, "       hblks      Number of mmapped regions                        %10ld    %10ld     %10ld\n",
 		m.hblks,      start_minfo.hblks,    (m.hblks    - start_minfo.hblks));
-	fprintf(fp, "      hblkhd      Space allocated in mmapped regions (bytes)       %10d    %10d     %10d\n",
+	fprintf(fp, "      hblkhd      Space allocated in mmapped regions (bytes)       %10ld    %10ld     %10ld\n",
 		m.hblkhd,     start_minfo.hblkhd,   (m.hblkhd   - start_minfo.hblkhd));
-	fprintf(fp, "     usmblks      Maximum total allocated space (bytes)            %10d    %10d     %10d\n",
+	fprintf(fp, "     usmblks      Maximum total allocated space (bytes)            %10ld    %10ld     %10ld\n",
 		m.usmblks,    start_minfo.usmblks,  (m.usmblks  - start_minfo.usmblks));
-	fprintf(fp, "     fsmblks      Space in freed fastbin blocks (bytes)            %10d    %10d     %10d\n",
+	fprintf(fp, "     fsmblks      Space in freed fastbin blocks (bytes)            %10ld    %10ld     %10ld\n",
 		m.fsmblks,    start_minfo.fsmblks,  (m.fsmblks  - start_minfo.fsmblks));
-	fprintf(fp, "    uordblks      Total allocated space (bytes)                    %10d    %10d     %10d\n",
+	fprintf(fp, "    uordblks      Total allocated space (bytes)                    %10ld    %10ld     %10ld\n",
 		m.uordblks,   start_minfo.uordblks, (m.uordblks - start_minfo.uordblks));
-	fprintf(fp, "    fordblks      Total free space (bytes)                         %10d    %10d     %10d\n",
+	fprintf(fp, "    fordblks      Total free space (bytes)                         %10ld    %10ld     %10ld\n",
 		m.fordblks,   start_minfo.fordblks, (m.fordblks - start_minfo.fordblks));
-	fprintf(fp, "    keepcost      Top-most, releasable space (bytes)               %10d    %10d     %10d\n",
+	fprintf(fp, "    keepcost      Top-most, releasable space (bytes)               %10ld    %10ld     %10ld\n",
 		m.keepcost,   start_minfo.keepcost, (m.keepcost - start_minfo.keepcost));
 	fprintf(fp, "\n");
 	fprintf(fp, "%s\n", separator);
