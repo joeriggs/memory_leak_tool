@@ -17,18 +17,21 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+// MMAP support isn't working yet, so leave it disabled.
+#undef MMAP_SUPPORT
+
+#ifdef MMAP_SUPPORT
 #include "breakpoint.h"
+#endif
+
 #include "memory_leak_tool.h"
 
 #ifndef RTLD_NEXT
 #define RTLD_NEXT  ((void *) -1l)
 #endif
 
-// MMAP support isn't working yet, so leave it disabled.
-#undef MMAP_SUPPORT
-
 // Ubuntu prefers mallinfo2().
-#define USE_MALLINFO2
+#undef USE_MALLINFO2
 
 static void memory_leak_tool_log_msg(const char *fmt, ...);
 #define MEM_HOOK_LOGGER memory_leak_tool_log_msg
@@ -149,6 +152,8 @@ static void alloc_event_add(void *ptr, size_t size)
 		pthread_mutex_lock(&free_event_queue_mutex);
 		if (TAILQ_EMPTY(&free_event_queue)) {
 			MEM_HOOK_LOGGER("Ran out of slots.\n");
+			pthread_mutex_unlock(&free_event_queue_mutex);
+			return;
 		}
 		struct alloc_event *new_entry = TAILQ_FIRST(&free_event_queue);
 		TAILQ_REMOVE(&free_event_queue, new_entry, tailq);
@@ -212,6 +217,9 @@ static void alloc_event_add(void *ptr, size_t size)
 			pthread_mutex_lock(&free_event_queue_mutex);
 			if (TAILQ_EMPTY(&free_event_queue)) {
 				MEM_HOOK_LOGGER("Ran out of slots.\n");
+				pthread_mutex_unlock(&free_event_queue_mutex);
+				pthread_mutex_unlock(&callers_event_queue_mutex);
+				return;
 			}
 			new_caller_entry = TAILQ_FIRST(&free_event_queue);
 			TAILQ_REMOVE(&free_event_queue, new_caller_entry, tailq);
@@ -282,6 +290,10 @@ static void alloc_event_del(void *ptr)
 				}
 				pthread_mutex_unlock(&callers_event_queue_mutex);
 			}
+
+			pthread_mutex_lock(&free_event_queue_mutex);
+			TAILQ_INSERT_TAIL(&free_event_queue, used_event_queue_entry, tailq);
+			pthread_mutex_unlock(&free_event_queue_mutex);
 		}
 	}
 
@@ -557,7 +569,6 @@ int memory_leak_tool_init(void)
 
 	// We log stuff to syslog.
 	openlog("memory_leak_tool", LOG_NDELAY | LOG_PID, LOG_DAEMON);
-	MEM_HOOK_LOGGER("Initializing the memory_leak_tool.\n");
 
 	int i;
 	for (i = 0; i < EVENT_QUEUE_NUM_BUCKETS; i++) {
