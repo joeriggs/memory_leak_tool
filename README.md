@@ -75,22 +75,23 @@ Reading the /tmp/malloc.log file, and interpreting the results:
 
   - Here is an example of the contents of /tmp/malloc.log:
 
+```
       $ cat /tmp/malloc.log 
 
       alloc_event_adds 10 (11260) : alloc_event_dels 6 (10948) : diff 4 (312).
-
+      =========================================================
       Add ref count    1: Del ref count    0: Size       1: Callers (3) ( 0x4011cb 0x7f6deee04873 0x400eee ).
       Add ref count    1: Del ref count    0: Size      65: Callers (7) ( 0x7f6deee5a6f8 0x7f6deee51cd5 0x7f6deeed72e3 0x401d47 0x401bbb 0x7f6def3b52de 0x7f6deeedd133 ).
       Add ref count    3: Del ref count    1: Size     123: Callers (3) ( 0x401223 0x7f6deee04873 0x400eee ).
-
+      =========================================================
       Ptr 0x13a74930: Size     123: Callers (3) ( 0x401223 0x7f6deee04873 0x400eee ).
       Ptr 0x13a749c0: Size     123: Callers (3) ( 0x401223 0x7f6deee04873 0x400eee ).
       Ptr 0x7f6de8000d70: Size      65: Callers (7) ( 0x7f6deee5a6f8 0x7f6deee51cd5 0x7f6deeed72e3 0x401d47 0x401bbb 0x7f6def3b52de 0x7f6deeedd133 ).
       Ptr 0x13a73d20: Size       1: Callers (3) ( 0x4011cb 0x7f6deee04873 0x400eee ).
       num_entries 4.  total_bytes_allocated 312.
-
+      =========================================================
       mallinfo() comparison:
-
+```
 
   The first section of the file contains a 1-line summary of activity:
 
