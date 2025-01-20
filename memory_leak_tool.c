@@ -52,11 +52,11 @@ static int memoryHooksEnabled = 0;
 static __thread int processingAnOperation = 0;
 
 // These are pointers to the functions that we've overloaded.
-static void *(*__calloc)(size_t number, size_t size) = NULL;
-static void *(*__malloc)(size_t size) = NULL;
-static int   (*__posix_memalign)(void **ptr, size_t alignment, size_t size) = NULL;
-static void *(*__realloc)(void *ptr, size_t size) = NULL;
-static void  (*__free)(const void *addr) = NULL;
+static void *(*__myCalloc)(size_t number, size_t size) = NULL;
+static void *(*__myMalloc)(size_t size) = NULL;
+static int   (*__myPosix_memalign)(void **ptr, size_t alignment, size_t size) = NULL;
+static void *(*__myRealloc)(void *ptr, size_t size) = NULL;
+static void  (*__myFree)(void *addr) = NULL;
 
 // We use one alloc_event object for each malloc operation that we're tracking.
 // This bunch of code defines the object, creates an array of objects that we
@@ -127,11 +127,13 @@ static unsigned char callocBuf[100][STATIC_CALLOC_BUF_SIZE];
 static void *callocBufBeg = &callocBuf[0][0];
 static void *callocBufEnd = &callocBuf[99][STATIC_CALLOC_BUF_SIZE - 1];
 
+#ifndef __FREEBSD__
 #ifdef USE_MALLINFO2
 static struct mallinfo2 start_minfo;
 #else
 static struct mallinfo start_minfo;
-#endif
+#endif // USE_MALLINFO2
+#endif // __FREEBSD__
 
 /* ************************************************************************** */
 /* **************** THESE ARE SOME PRIVATE UTILITY FUNCTIONS **************** */
@@ -454,7 +456,7 @@ static int munmap_post_cb(uint64_t retcode)
 
 void *calloc(size_t number, size_t size)
 {
-	if (__calloc == NULL) {
+	if (__myCalloc == NULL) {
 		static int called_dlsym = 0;
 
 		/* We need to make sure we only call dlsym() once.  dlsym() is
@@ -462,7 +464,7 @@ void *calloc(size_t number, size_t size)
 		 * don't get caught in a loop. */
 		if (!called_dlsym) {
 			called_dlsym = 1;
-			__calloc = dlsym(RTLD_NEXT, "calloc");
+			__myCalloc = dlsym(RTLD_NEXT, "calloc");
 		}
 
 		else {
@@ -483,7 +485,7 @@ void *calloc(size_t number, size_t size)
 		}
 	}
 
-	void *ptr = __calloc(number, size);
+	void *ptr = __myCalloc(number, size);
 
 	alloc_event_add(ptr, size);
 
@@ -492,10 +494,10 @@ void *calloc(size_t number, size_t size)
 
 void *malloc(size_t size)
 {
-	if (__malloc == NULL)
-		__malloc = dlsym(RTLD_NEXT, "malloc");
+	if (__myMalloc == NULL)
+		__myMalloc = dlsym(RTLD_NEXT, "malloc");
 
-	void *ptr = __malloc(size);
+	void *ptr = __myMalloc(size);
 
 	alloc_event_add(ptr, size);
 
@@ -504,10 +506,10 @@ void *malloc(size_t size)
 
 int posix_memalign(void **ptr, size_t alignment, size_t size)
 {
-	if (__posix_memalign == NULL)
-		__posix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
+	if (__myPosix_memalign == NULL)
+		__myPosix_memalign = dlsym(RTLD_NEXT, "posix_memalign");
 
-	int rc = __posix_memalign(ptr, alignment, size);
+	int rc = __myPosix_memalign(ptr, alignment, size);
 
 	alloc_event_add(*ptr, size);
 
@@ -516,10 +518,10 @@ int posix_memalign(void **ptr, size_t alignment, size_t size)
 
 void *realloc(void *ptr, size_t size)
 {
-	if (__realloc == NULL)
-		__realloc = dlsym(RTLD_NEXT, "realloc");
+	if (__myRealloc == NULL)
+		__myRealloc = dlsym(RTLD_NEXT, "realloc");
 
-	void *new_ptr = __realloc(ptr, size);
+	void *new_ptr = __myRealloc(ptr, size);
 
 	alloc_event_add(new_ptr, size);
 
@@ -532,10 +534,10 @@ void free(void *ptr)
 	if ((ptr >= callocBufBeg) && (ptr <= callocBufEnd))
 		return;
 
-	if (__free == NULL)
-		__free = dlsym(RTLD_NEXT, "free");
+	if (__myFree == NULL)
+		__myFree = dlsym(RTLD_NEXT, "free");
 
-	__free(ptr);
+	__myFree(ptr);
 
 	alloc_event_del(ptr);
 }
@@ -560,12 +562,14 @@ int memory_leak_tool_init(void)
 {
 	int retcode = 0;
 
+#ifndef __FREEBSD__
 	// Get the starting malloc info.
 #ifdef USE_MALLINFO2
 	start_minfo = mallinfo2();
 #else
 	start_minfo = mallinfo();
 #endif
+#endif // __FREEBSD__
 
 	// We log stuff to syslog.
 	openlog("memory_leak_tool", LOG_NDELAY | LOG_PID, LOG_DAEMON);
@@ -614,12 +618,14 @@ int memory_leak_tool_start(void)
 		return 1;
 	}
 
+#ifndef __FREEBSD__
 	// Get the starting malloc info.
 #ifdef USE_MALLINFO2
 	start_minfo = mallinfo2();
 #else
 	start_minfo = mallinfo();
 #endif
+#endif // __FREEBSD__
 
 	memoryHooksEnabled = 1;
 	return 0;
@@ -720,7 +726,9 @@ int memory_leak_tool_log_data(void)
 
 	processingAnOperation = 1;
 
+#ifndef __FREEBSD__
 	malloc_trim(0);
+#endif // __FREEBSD__
 
 	FILE *fp = fopen(LOG_FILE, "w+");
 	if (fp == NULL) {
@@ -785,6 +793,7 @@ int memory_leak_tool_log_data(void)
 	fprintf(fp, "num_entries %d.  total_bytes_allocated %ld.\n", num_entries, total_bytes_allocated);
 	fprintf(fp, "%s\n", separator);
 
+#ifndef __FREEBSD__
 	// Get current statistics related to the process heap.
 #ifdef USE_MALLINFO2
 	struct mallinfo2 m = mallinfo2();
@@ -823,9 +832,12 @@ int memory_leak_tool_log_data(void)
 	// all of the arenas.
 	malloc_info(0, fp);
 	fprintf(fp, "%s\n", separator);
+#endif // __FREEBSD__
 
 	fclose(fp);
 
 	processingAnOperation = 0;
+
+	return 0;
 }
 
